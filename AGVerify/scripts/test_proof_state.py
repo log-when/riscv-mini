@@ -356,3 +356,30 @@ class TestFuzzyPort(unittest.TestCase):
         self.assertIsNone(ps.ProofState._fuzzy_port(
             "io.cpu.re", {"io.cpu.req.valid": "I", "io.cpu.resp.valid": "O"}))
         self.assertIsNone(ps.ProofState._fuzzy_port("zzz", {}))
+
+
+class TestInternalStateBan(unittest.TestCase):
+    """expr 信号禁止引用非 io.* 端口路径(内部状态锁死模块绑定)。"""
+
+    def test_state_reference_rejected(self):
+        st = mk_state()
+        st.nodes[st.root].strategy = "CONJUNCT"
+        # state === sIdle: 引用内部寄存器 state → 应拒绝
+        with self.assertRaises(ps.ProofStateError) as cm:
+            st.add_property(st.root, {
+                "id": "C1", "nl": "x", "formula": "G(arbIdle)",
+                "signals": {"arbIdle": {
+                    "module": "ICache",
+                    "expr": "state === CacheState.sIdle"}}})
+        self.assertIn("非端口信号", str(cm.exception))
+
+    def test_port_combination_allowed(self):
+        st = mk_state()
+        st.nodes[st.root].strategy = "CONJUNCT"
+        # 纯端口组合 → 应通过
+        r = st.add_property(st.root, {
+            "id": "C2", "nl": "x", "formula": "G(reqFire)",
+            "signals": {"reqFire": {
+                "module": "ICache",
+                "expr": "io.nasti.ar.valid && io.nasti.ar.ready"}}})
+        self.assertNotIn("state", str(r))

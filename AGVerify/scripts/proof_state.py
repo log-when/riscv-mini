@@ -20,6 +20,7 @@
 """
 
 import json
+import re
 import math
 import re
 from dataclasses import dataclass, field
@@ -407,7 +408,24 @@ class ProofState:
         for local, s in (spec.get("signals") or {}).items():
             mod, port = s["module"], s.get("port")
             if port is None or port.startswith("expr:"):
-                continue                    # expr 信号: 交编译检查校验
+                # expr 内部状态校验 (2026-10-08): 引用非 io.* 的标识符
+                # = 内部状态引用, 跨模块改写必败, 当场拒绝
+                expr = s.get("expr") or ""
+                if expr:
+                    # 先剥掉所有 io.* 路径, 剩余标识符 = 内部信号
+                    stripped = re.sub(r"io\.[A-Za-z0-9_.]+", "", expr)
+                    ids = set(re.findall(
+                        r"[a-z_][A-Za-z0-9_]*", stripped))
+                    ids -= {"true", "false", "and", "or", "not",
+                            "b", "h"}
+                    bad = [x for x in ids
+                           if not x[0].isupper()]  # 大写=类型/常量名
+                    if bad:
+                        raise ProofStateError(
+                            f"expr 信号 {local} 引用了非端口信号 {bad}——"
+                            f"内部状态在其他模块不可见, 跨模块改写必败; "
+                            f"请改写为 io.* 端口信号的组合 (expr: {expr[:60]})")
+                continue
             info = self.h.modules.get(mod)
             if info is None or not info.src:
                 continue            # 未定义/无源码模块交 classify 处理
