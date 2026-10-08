@@ -1,0 +1,55 @@
+{
+  "modules": [
+    {
+      "name": "Tile",
+      "src": "src/main/scala/mini/Tile.scala",
+      "cls": "Tile"
+    },
+    {
+      "name": "Datapath",
+      "inst": "core",
+      "parent": "Tile",
+      "src": "src/main/scala/mini/Datapath.scala",
+      "cls": "Datapath"
+    },
+    {
+      "name": "ICache",
+      "inst": "icache",
+      "parent": "Tile",
+      "src": "src/main/scala/mini/Cache.scala",
+      "cls": "Cache"
+    },
+    {
+      "name": "DCache",
+      "inst": "dcache",
+      "parent": "Tile",
+      "src": "src/main/scala/mini/Cache.scala",
+      "cls": "Cache"
+    },
+    {
+      "name": "MemArbiter",
+      "inst": "arb",
+      "parent": "Tile",
+      "src": "src/main/scala/mini/Tile.scala",
+      "cls": "MemArbiter"
+    }
+  ],
+  "connections": [
+    {
+      "from": "Datapath.io.icache",
+      "to": "ICache.io.cpu"
+    },
+    {
+      "from": "Datapath.io.dcache",
+      "to": "DCache.io.cpu"
+    },
+    {
+      "from": "MemArbiter.io.icache",
+      "to": "ICache.io.nasti"
+    },
+    {
+      "from": "MemArbiter.io.dcache",
+      "to": "DCache.io.nasti"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+# 运行数据 (每次 run 1-2GB)
+results/
+results_backup*/
+llm_calls/
+sbt/
+
+# 缓存
+out/
+__pycache__/
+*.pyc
+
+# 敏感配置
+agents/.env
+
+# 历史备份 spec
+spec/properties.backup_*.json

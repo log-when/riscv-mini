@@ -1,0 +1,34 @@
+[
+  {
+    "id": "X1",
+    "module": "ICache",
+    "nl": "Nasti 读通道 ready 无穷经常为真",
+    "formula": "F rdy",
+    "signals": {
+      "rdy": {
+        "module": "ICache",
+        "port": "io.nasti.ar.ready"
+      }
+    },
+    "trusted": true,
+    "assert_kind": "global"
+  },
+  {
+    "id": "X2",
+    "module": "Tile",
+    "nl": "外部 Nasti 写响应必达",
+    "formula": "aw_fire -> X F b_valid",
+    "signals": {
+      "aw_fire": {
+        "module": "Tile",
+        "port": "io.nasti.aw.fire"
+      },
+      "b_valid": {
+        "module": "Tile",
+        "port": "io.nasti.b.valid"
+      }
+    },
+    "trusted": true,
+    "assert_kind": "global"
+  }
+]

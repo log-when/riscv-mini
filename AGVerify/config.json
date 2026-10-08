@@ -1,0 +1,22 @@
+{
+  "rollback_max_fail": 20,
+  "bmc_bound": 15,
+  "bmc_timeout_sec": 600,
+  "ic3_iters": 20,
+  "ic3_timeout_sec": 600,
+  "compile_check": true,
+  "max_agent_calls": 150,
+  "anti_degenerate": true,
+  "abort_on_framework_error": true,
+  "framework_error_patterns": [
+    "is already defined",
+    "not found: type AG",
+    "identifier expected"
+  ],
+  "sbt_xmx": "8G",
+  "max_depth": 7,
+  "search_mode": "bfs",
+  "timeout_retry_max": 5,
+  "kb_as_premises": true,
+  "kb_premises_max": 8
+}

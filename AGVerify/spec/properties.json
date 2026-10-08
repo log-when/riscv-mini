@@ -1,0 +1,18 @@
+{
+  "id": "P2",
+  "scope": "atomic",
+  "module": "DCache",
+  "nl": "CPU 对 DCache 的请求永久停止后, DCache 向总线的读地址请求最终永久消失 (FreezePropertyProofChain 之 P2, 写性质的对偶)",
+  "formula": "(G !cpuReqValid) -> FG (!nastiReadReqValid)",
+  "signals": {
+    "cpuReqValid": {
+      "module": "DCache",
+      "port": "io.cpu.req.valid"
+    },
+    "nastiReadReqValid": {
+      "module": "DCache",
+      "port": "io.nasti.ar.valid"
+    }
+  },
+  "assert_kind": "global"
+}

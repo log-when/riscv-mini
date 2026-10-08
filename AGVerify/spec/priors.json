@@ -1,0 +1,117 @@
+[
+  {
+    "id": "X1",
+    "formula": "F nastiWriteReqReady",
+    "nl": "Nasti 写通道 ready 无穷经常为真",
+    "trusted": true,
+    "signals": {
+      "nastiWriteReqReady": {
+        "module": "MemArbiter",
+        "port": "io.nasti.aw.ready"
+      }
+    },
+    "module": "MemArbiter"
+  },
+  {
+    "id": "X2",
+    "formula": "F nastiReadReqReady",
+    "nl": "Nasti 读通道 ready 无穷经常为真",
+    "trusted": true,
+    "signals": {
+      "nastiReadReqReady": {
+        "module": "MemArbiter",
+        "port": "io.nasti.ar.ready"
+      }
+    },
+    "module": "MemArbiter"
+  },
+  {
+    "id": "X3",
+    "formula": "nastiReadReqFire -> X F nastiReadRespValid",
+    "nl": "读请求被接受后, 读响应最终到来",
+    "trusted": true,
+    "signals": {
+      "nastiReadReqFire": {
+        "module": "MemArbiter",
+        "port": "io.nasti.ar.fire"
+      },
+      "nastiReadRespValid": {
+        "module": "MemArbiter",
+        "port": "io.nasti.r.valid"
+      }
+    },
+    "module": "MemArbiter"
+  },
+  {
+    "id": "X4",
+    "formula": "nastiReadRespValid -> (!nastiReadRespFinsh ##1 (nastiReadRespValid & nastiReadRespFinsh))",
+    "nl": "读响应一旦出现将持续有效直至 last 拍",
+    "trusted": true,
+    "signals": {
+      "nastiReadRespValid": {
+        "module": "MemArbiter",
+        "port": "io.nasti.r.valid"
+      },
+      "nastiReadRespFinsh": {
+        "module": "MemArbiter",
+        "port": "io.nasti.r.bits.last"
+      }
+    },
+    "module": "MemArbiter"
+  },
+  {
+    "id": "X5",
+    "formula": "nastiWriteReqFire -> X F (nastiWriteMemReady U (nastiWriteMemReady & nastiWriteRespFinsh))",
+    "nl": "写数据通道最终就绪直至 last",
+    "trusted": true,
+    "signals": {
+      "nastiWriteReqFire": {
+        "module": "MemArbiter",
+        "port": "io.nasti.aw.fire"
+      },
+      "nastiWriteMemReady": {
+        "module": "MemArbiter",
+        "port": "io.nasti.w.ready"
+      },
+      "nastiWriteRespFinsh": {
+        "module": "MemArbiter",
+        "port": "io.nasti.w.bits.last"
+      }
+    },
+    "module": "MemArbiter"
+  },
+  {
+    "id": "X6",
+    "formula": "nastiWriteReqFire -> X F (nastiWriteRespValid U nastiWriteRespFire)",
+    "nl": "写响应必达",
+    "trusted": true,
+    "signals": {
+      "nastiWriteReqFire": {
+        "module": "MemArbiter",
+        "port": "io.nasti.aw.fire"
+      },
+      "nastiWriteRespValid": {
+        "module": "MemArbiter",
+        "port": "io.nasti.b.valid"
+      },
+      "nastiWriteRespFire": {
+        "module": "MemArbiter",
+        "port": "io.nasti.b.fire"
+      }
+    },
+    "module": "MemArbiter"
+  },
+  {
+    "id": "X7",
+    "formula": "G !dcacheCpuAbort",
+    "nl": "系统配置: CPU 不中止挂起的 DCache 操作 (abort 恒低)",
+    "trusted": true,
+    "signals": {
+      "dcacheCpuAbort": {
+        "module": "DCache",
+        "port": "io.cpu.abort"
+      }
+    },
+    "module": "DCache"
+  }
+]
