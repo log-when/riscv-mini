@@ -141,9 +141,9 @@ class Datapath(val conf: CoreConfig) extends Module {
   io.dcache.req.valid := !stall && (io.ctrl.st_type.orR || io.ctrl.ld_type.orR)
   io.dcache.req.bits.addr := daddr
   io.dcache.req.bits.data := rs2 << woffset
-  io.dcache.req.bits.mask := MuxLookup(Mux(stall, st_type, io.ctrl.st_type), "b0000".U)(
+  io.dcache.req.bits.mask := MuxLookup(Mux(stall, st_type, io.ctrl.st_type), "b0000".U, (
     Seq(ST_SW -> "b1111".U, ST_SH -> ("b11".U << alu.io.sum(1, 0)), ST_SB -> ("b1".U << alu.io.sum(1, 0)))
-  )
+  ))
 
   // Pipelining
   when(reset.asBool || !stall && csr.io.expt) {
@@ -170,14 +170,14 @@ class Datapath(val conf: CoreConfig) extends Module {
   // Load
   val loffset = (ew_reg.alu(1) << 4.U).asUInt | (ew_reg.alu(0) << 3.U).asUInt
   val lshift = io.dcache.resp.bits.data >> loffset
-  val load = MuxLookup(ld_type, io.dcache.resp.bits.data.zext)(
+  val load = MuxLookup(ld_type, io.dcache.resp.bits.data.zext, (
     Seq(
       LD_LH -> lshift(15, 0).asSInt,
       LD_LB -> lshift(7, 0).asSInt,
       LD_LHU -> lshift(15, 0).zext,
       LD_LBU -> lshift(7, 0).zext
     )
-  )
+  ))
 
   // CSR access
   csr.io.stall := stall
@@ -194,9 +194,9 @@ class Datapath(val conf: CoreConfig) extends Module {
 
   // Regfile Write
   val regWrite =
-    MuxLookup(wb_sel, ew_reg.alu.zext)(
+    MuxLookup(wb_sel, ew_reg.alu.zext, (
       Seq(WB_MEM -> load, WB_PC4 -> (ew_reg.pc + 4.U).zext, WB_CSR -> csr.io.out.zext)
-    ).asUInt
+    )).asUInt
 
   regFile.io.wen := wb_en && !stall && !csr.io.expt
   regFile.io.waddr := wb_rd_addr
@@ -204,7 +204,7 @@ class Datapath(val conf: CoreConfig) extends Module {
 
   // Abort store when there's an excpetion
   io.dcache.abort := csr.io.expt
-
+  assume(!io.dcache.abort)
   // TODO: re-enable through AOP
 //  if (p(Trace)) {
 //    printf(
