@@ -18,7 +18,7 @@ object MiniConfig {
       ),
       cache = CacheConfig(
         nWays = 1,
-        nSets = 256,
+        nSets = 64,
         blockBytes = 4 * (xlen / 8) // 4 * 32 bits = 16B
       ),
       nasti = NastiBundleParameters(

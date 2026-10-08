@@ -255,9 +255,9 @@ class CSR(val xlen: Int) extends Module {
   io.epc := mepc
 
   // Counters
-  time := time + 1.U
+  time := time 
   when(time.andR) { timeh := timeh + 1.U }
-  cycle := cycle + 1.U
+  cycle := cycle
   when(cycle.andR) { cycleh := cycleh + 1.U }
   val isInstRet = io.inst =/= Instructions.NOP && (!io.expt || isEcall || isEbreak) && !io.stall
   when(isInstRet) { instret := instret + 1.U }
