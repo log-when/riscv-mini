@@ -23,6 +23,8 @@ def setUpModule():
     import tempfile
     dp.REPORT = Path(tempfile.mkdtemp())
     dp.SEARCH_MODE = "dfs"
+    dp.VERIFY_MODE = "standard"
+    ps.CONFIG["verify_mode"] = "standard"
 
 HIER = {
     "modules": [
@@ -671,20 +673,20 @@ class TestGuards(unittest.TestCase):
             "signals": {"a": {"module": "ICache", "port": "io.a"},
                         "b": {"module": "ICache", "port": "io.b"}}})
         self.assertTrue(d._conclusion_input_guard(st.root, r["id"]))
-        self.assertTrue(any(x.cause == "CONCLUSION_IS_INPUT"
-                            for x in st.failures))
+        # failure 由调用方(BFS children 循环)记录, guard 本身只做检测
         # 结论为 Output 信号不触发(Datapath.imem* 在 FakeReader 是 Output)
         r2 = st.add_property(st.root, {
             "id": "C2", "nl": "x", "formula": "b -> F imemReq",
             "signals": {"imemReq": {"module": "Datapath", "port": "imem.req"},
                         "b": {"module": "ICache", "port": "io.b"}}})
         self.assertFalse(d._conclusion_input_guard(st.root, r2["id"]))
-        # 复合结论不触发(保守)
+        # 复合结论全 Input → 触发(2026-10-09 放宽后); 混合方向不触发
         r3 = st.add_property(st.root, {
-            "id": "C3", "nl": "x", "formula": "a -> F (b & c)",
+            "id": "C3", "nl": "x", "formula": "a -> F (b & imemReq)",
             "signals": {"a": {"module": "ICache", "port": "io.a"},
                         "b": {"module": "ICache", "port": "io.b"},
-                        "c": {"module": "ICache", "port": "io.c"}}})
+                        "imemReq": {"module": "Datapath",
+                                    "port": "imem.req"}}})
         self.assertFalse(d._conclusion_input_guard(st.root, r3["id"]))
 
     def test_ltl_syntax_check(self):
@@ -751,3 +753,94 @@ class TestChainAssumesAndKbFamily(unittest.TestCase):
         self.assertIn("G(rdy)", blk[0]["formula"])
         fam = d._kb_family_summary()
         self.assertIsInstance(fam, dict)
+
+
+class TestBmcFirstMode(unittest.TestCase):
+    """bmc_first 模式: 中间节点只跑 BMC, KB 容忍 bmc 级, 批量 IC3 延后。"""
+
+    def setUp(self):
+        self._orig = dp.VERIFY_MODE
+        dp.VERIFY_MODE = "bmc_first"
+        ps.CONFIG["verify_mode"] = "bmc_first"
+
+    def tearDown(self):
+        dp.VERIFY_MODE = self._orig
+        ps.CONFIG["verify_mode"] = self._orig
+
+    def test_bmc_only_no_ic3(self):
+        """bmc_first: module 验证只调 bmc, 不调 ic3。"""
+        modes = []
+
+        def v(module, signals, assert_formula, assumes, mode, **k):
+            modes.append(mode)
+            return {"verdict": "PASS", "detail": ""}
+
+        d = mk_dispatcher(v)
+        st = d.st
+        st.nodes[st.root].strategy = "CONJUNCT"
+        r = st.add_property(st.root, {
+            "id": "C1", "nl": "x", "formula": "a -> F b",
+            "signals": {"a": {"module": "Datapath", "port": "imem.req"},
+                        "b": {"module": "Datapath", "port": "imem.ack"}}})
+        raw = d.run_module_ic3(r["id"])
+        self.assertEqual(raw["verdict"], "PASS")
+        self.assertIn("IC3 deferred", raw.get("detail", ""))
+        self.assertIn("bmc", modes)
+        self.assertNotIn("ic3", modes)  # 不应调用 ic3
+
+    def test_kb_accepts_bmc_level(self):
+        """bmc_first: BMC_FILTERED 节点也入 KB, proof_strength=bmc。"""
+        st = tp.mk_state()
+        ps.CONFIG["verify_mode"] = "bmc_first"
+        st.nodes[st.root].strategy = "CONJUNCT"
+        r = st.add_property(st.root, {
+            "id": "C1", "nl": "x", "formula": "G(a)",
+            "signals": {"a": {"module": "ICache", "port": "io.a"}}})
+        st.mark(r["id"], ps.BMC_FILTERED)
+        self.assertTrue(st.try_kb_ingest(r["id"]))
+        self.assertEqual(len(st.kb.entries), 1)
+        self.assertEqual(st.kb.entries[0].proof_strength, "bmc")
+        ps.CONFIG["verify_mode"] = "standard"
+        # standard 模式下 BMC_FILTERED 不入库
+        r2 = st.add_property(st.root, {
+            "id": "C2", "nl": "x", "formula": "F(a)",
+            "signals": {"a": {"module": "ICache", "port": "io.a"}}})
+        st.mark(r2["id"], ps.BMC_FILTERED)
+        self.assertFalse(st.try_kb_ingest(r2["id"]))
+
+    def test_kb_remove(self):
+        """KB.remove 按 kid 移除。"""
+        st = tp.mk_state()
+        st.nodes[st.root].strategy = "CONJUNCT"
+        r = st.add_property(st.root, {
+            "id": "C1", "nl": "x", "formula": "G(a)",
+            "signals": {"a": {"module": "ICache", "port": "io.a"}}})
+        st.mark(r["id"], ps.IC3_PROVEN)
+        kid = st.kb.entries[0].kid
+        self.assertTrue(st.kb.remove(kid))
+        self.assertEqual(len(st.kb.entries), 0)
+        self.assertFalse(st.kb.remove(kid))
+
+
+class TestGuardMultiAtom(unittest.TestCase):
+    """结论守卫放宽: 多原子结论全 Input 才触发, 混合方向不触发。"""
+
+    def test_multi_atom(self):
+        d = mk_dispatcher(lambda **k: {"verdict": "PASS", "detail": ""})
+        st = d.st
+        st.nodes[st.root].strategy = "CONJUNCT"
+        # 全 Input: a -> F (b & c) → 应触发
+        r1 = st.add_property(st.root, {
+            "id": "M1", "nl": "x", "formula": "a -> F (b & c)",
+            "signals": {"a": {"module": "ICache", "port": "io.a"},
+                        "b": {"module": "ICache", "port": "io.b"},
+                        "c": {"module": "ICache", "port": "io.c"}}})
+        self.assertTrue(d._conclusion_input_guard(st.root, r1["id"]))
+        # 混合: a -> F (b & imemReq) → b 是 Input 但 imemReq 是 Output → 不触发
+        r2 = st.add_property(st.root, {
+            "id": "M2", "nl": "x", "formula": "a -> F (b & imemReq)",
+            "signals": {"a": {"module": "ICache", "port": "io.a"},
+                        "b": {"module": "ICache", "port": "io.b"},
+                        "imemReq": {"module": "Datapath",
+                                    "port": "imem.req"}}})
+        self.assertFalse(d._conclusion_input_guard(st.root, r2["id"]))

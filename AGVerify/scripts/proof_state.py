@@ -243,6 +243,7 @@ class KBEntry:
     node_origin: str = ""
     signals: Dict = field(default_factory=dict)   # 重建空设计声明用
     proven_at: Optional[str] = None               # 实际证毕的模块(多落点)
+    proof_strength: str = "ic3"       # "ic3" | "bmc" (bmc_first 模式建树期)
 
     @property
     def sig(self) -> Tuple[frozenset, str]:
@@ -257,15 +258,23 @@ class KB:
     def add(self, formula: str, wire_ids: List[str], node_origin: str,
             nl: str = "", signals: Optional[Dict] = None,
             proven_at: Optional[str] = None,
-            level: int = 1) -> KBEntry:
+            level: int = 1,
+            proof_strength: str = "ic3") -> KBEntry:
         self._n += 1
         e = KBEntry(f"T{self._n}", norm_formula(formula), nl,
                     wire_ids=list(wire_ids), node_origin=node_origin,
                     signals=signals or {}, proven_at=proven_at,
-                    formula_raw=formula)
+                    formula_raw=formula,
+                    proof_strength=proof_strength)
         e.sig_key = signature(formula, wire_ids, signals, level)
         self.entries.append(e)
         return e
+
+    def remove(self, kid: str) -> bool:
+        """按 kid 移除条目(批量 IC3 败时剔除)。返回是否移除。"""
+        before = len(self.entries)
+        self.entries = [e for e in self.entries if e.kid != kid]
+        return len(self.entries) < before
 
     def lookup(self, formula: str, wire_ids: List[str],
                signals: Dict = None, level: int = 1) -> Optional[KBEntry]:
@@ -279,6 +288,7 @@ class KB:
         return [{"id": e.kid, "formula": e.formula_raw or e.formula,
                  "nl": e.nl,
                  "wires": e.wire_ids,
+                 "strength": e.proof_strength,
                  **({"proven_at": e.proven_at} if e.proven_at else {})}
                 for e in self.entries]
 
@@ -402,6 +412,67 @@ class ProofState:
             if not s.get("port"):
                 s["port"] = "expr:" + s.get("expr", "?")
 
+    @staticmethod
+    def _canonical_expr(expr: str) -> str:
+        """expr 的规范形式: 交换律排序(同层全&或全|时安全排序操作数),
+        使 a&b 与 b&a 得到相同键。嵌套/混合不排序(保守)。"""
+        import re as _re
+        s = expr.replace(" ", "")
+        # 提取由单一操作符连接的扁平项
+        parts = _re.split(r'[&|]', s)
+        ops = _re.findall(r'[&|]', s)
+        if len(parts) > 1 and len(set(ops)) == 1:
+            # 全&或全|: 排序安全
+            s = ops[0].join(sorted(parts))
+        return s
+
+    def _normalize_signal_aliases(self, spec: Dict) -> bool:
+        """信号别名归一 (2026-10-09 用户语义):
+        ① 同一物理信号(wire_id 相同)的别名 → 统一
+        ② 同模块内等价布尔组合(expr 规范形式相同)的别名 → 统一
+        归一后公式改写+信号去重, 平凡真(a→a)由上游过滤。
+        注意: 仅在同一子模块内归一(跨模块由等价类机制处理)。
+        返回是否发生了改写。"""
+        import re as _re
+        signals = spec.get("signals") or {}
+        # ① wire_id 归一(端口信号)
+        wire_to_alias = {}
+        rewrites = {}
+        for alias in signals:
+            try:
+                wid = wire_id_of(signals[alias], self.h)
+                if wid in wire_to_alias:
+                    rewrites[alias] = wire_to_alias[wid]
+                else:
+                    wire_to_alias[wid] = alias
+            except Exception:
+                continue
+        # ② expr 规范形式归一(布尔组合, 同模块内)
+        canon_to_alias = {}
+        for alias, s in signals.items():
+            if alias in rewrites:
+                continue
+            expr = s.get("expr")
+            if not expr or not s.get("module"):
+                continue
+            # 规范键 = 模块 + 规范化表达式(子模块边界)
+            key = (s["module"], self._canonical_expr(expr))
+            if key in canon_to_alias:
+                rewrites[alias] = canon_to_alias[key]
+            else:
+                canon_to_alias[key] = alias
+        if not rewrites:
+            return False
+        # 改写公式(长名优先防止前缀覆盖)
+        formula = spec.get("formula", "")
+        for old_a in sorted(rewrites, key=len, reverse=True):
+            new_a = rewrites[old_a]
+            formula = _re.sub(r"\b%s\b" % _re.escape(old_a), new_a, formula)
+        spec["formula"] = formula
+        for old_a in rewrites:
+            signals.pop(old_a, None)
+        return True
+
     def _check_signal_hosts(self, spec: Dict):
         """入队前宿主校验: signal.module 的端口组前缀须在该模块端口表中。
         本地 0 成本拦截宿主写错（否则 40s sbt 编译才暴露）。"""
@@ -470,6 +541,7 @@ class ProofState:
     def _build(self, node_id, spec: Dict, kind: str,
                locked: bool = False, depth: int = 0) -> Node:
         try:
+            self._normalize_signal_aliases(spec)
             self._check_signal_hosts(spec)
             classified = classify(spec, self.h, self.reader)
         except ClassifyError as e:
@@ -660,6 +732,7 @@ class ProofState:
                 f"应改释为驱动模块上的子性质分解）")
         self._normalize_signals(spec)
         self._autocorrect_module(spec)
+        self._normalize_signal_aliases(spec)
         self._check_signal_hosts(spec)
         self.check_binding_drift(spec["formula"], spec.get("signals") or {})
         gate = self._assume_gate_signals(spec["formula"])
@@ -857,23 +930,40 @@ class ProofState:
     def try_kb_ingest(self, node_id) -> bool:
         """入库门禁 (2026-10-06): 未清偿 assume 的证毕是【条件证毕】,
         不得入 KB——否则 N86 型污染(依赖幽灵假设)直通定理库。
+        bmc_first 模式 (2026-10-08): BMC_FILTERED 也入库, 标 proof_strength
+        ="bmc"(建树期快速复用; 批量 IC3 后升级或剔除)。
         幂等: 已在 KB(按来源节点)则跳过。返回是否入库。"""
         node = self.nodes.get(node_id)
-        if not node or node.status != IC3_PROVEN:
+        if not node:
+            return False
+        bmc_first = CONFIG.get("verify_mode") == "bmc_first"
+        ok_status = (IC3_PROVEN or
+                     (bmc_first and BMC_FILTERED))
+        if node.status not in ((IC3_PROVEN,)
+                               if not bmc_first
+                               else (IC3_PROVEN, BMC_FILTERED)):
             return False
         for e in self.kb.entries:
             if e.node_origin == node_id:
                 return False
+        # bmc_first 模式下 IC3_PROVEN 可能是升级路径标的(实际只过了 BMC):
+        # 用 VERIFY_MODE 判断, 而非只看节点 status
+        if CONFIG.get("verify_mode") == "bmc_first":
+            # 检查该节点是否有 module_ic3 阶段的 PASS 记录(多落点/直证IC3)
+            strength = "ic3" if getattr(node, "_ic3_verified", False) else "bmc"
+        else:
+            strength = "ic3"
         for aid in (getattr(node, "assumes", None) or []):
             a = self.nodes.get(aid)
             d = self.nodes.get(a.discharged_by) if a else None
-            if d is None or d.status != IC3_PROVEN:
+            if d is None or d.status not in (IC3_PROVEN, BMC_FILTERED):
                 return False
         self.kb.add(node.formula,
                     self.registry.wire_ids_of(node_id), node_id, node.nl,
                     signals=node.signals,
                     proven_at=getattr(node, "proven_at", None),
-                    level=2)
+                    level=2,
+                    proof_strength=strength)
         return True
 
     def record_failure(self, node_id: str, outcome: str, cause: str = "",

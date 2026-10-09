@@ -66,6 +66,7 @@ from critic import critique
 MAX_AGENT_CALLS = ps.CONFIG["max_agent_calls"]
 LLM_MAX_RETRIES = 10                    # LLM 瞬时故障退避重试上限
 SEARCH_MODE = ps.CONFIG.get("search_mode", "dfs")   # dfs | bfs
+VERIFY_MODE = ps.CONFIG.get("verify_mode", "standard")  # standard | bmc_first
 ABORT_ON_FRAMEWORK_ERROR = ps.CONFIG.get("abort_on_framework_error", True)
 FRAMEWORK_ERROR_PATTERNS = ps.CONFIG.get("framework_error_patterns", [])
 
@@ -253,46 +254,46 @@ class Dispatcher:
         # U 的右支作为结论核
         if " U " in concl or ")U" in concl.replace(" ", ""):
             concl = re.split(r"\s+U\s+|\)U|U\(", concl.replace(" ", ""))[-1]
-        m = re.fullmatch(r"!?([A-Za-z_]\w*)", concl.replace(" ", ""))
-        if not m:
-            return False                       # 复合/非原子结论: 不触发
-        alias = m.group(1)
-        sdef = (node.signals or {}).get(alias) or {}
-        if not sdef.get("port"):
-            return False                       # expr 定义: 不触发
-        mod = sdef.get("module")
-        if not mod:
-            return False
-        try:
-            if st.reader.port_direction(mod, sdef["port"]) != "Input":
-                return False
-        except Exception:
-            return False
-        # writer 视图提示: 同网络其它视角中方向为 Output 的模块
+        # 提取结论中全部信号原子(支持布尔组合; 2026-10-09 用户放宽:
+        # 单原子 → 全原子都是 Input 才触发, 混合方向不触发)
+        atoms = set(re.findall(
+            r"!?([A-Za-z_]\w*)", concl.replace(" ", "")))
+        atoms -= {"G", "F", "X", "U"}          # 排除时态算子
+        if not atoms:
+            return False                       # 无信号原子
+        # 逐原子检查方向: 全部是 Input 才触发
+        all_input = True
         writers = []
-        try:
-            wid = ps.wire_id_of(sdef, st.h)
-            ent = st.registry.entries.get(wid)
-            for v in (getattr(ent, "views", None) or ()):
-                vm, _, vp = v.partition(".")
-                try:
-                    if st.reader.port_direction(vm, vp) == "Output":
-                        writers.append(v)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        whint = ("; 同网络输出侧视角: " + ", ".join(writers)) if writers \
-            else "; 请检查该信号的驱动模块并换到该模块视角"
-        st.record_failure(task, "ITER_EXCEED",
-                          cause="CONCLUSION_IS_INPUT",
-                          evidence=f"子性质结论信号 {alias}"
-                                   f"({mod}.{sdef['port']}) 在本模块是 Input"
-                                   f"(自由输入), 本模块永不可证: {f}",
-                          hint="结论是模块的自由输入时该模块不可证——请在"
-                               "信号 writer(驱动)模块视角下改写本性质或换"
-                               "结论形状" + whint)
-        return True
+        for alias in atoms:
+            sdef = (node.signals or {}).get(alias) or {}
+            if not sdef.get("port"):
+                all_input = False              # expr 定义: 不触发
+                break
+            mod = sdef.get("module")
+            if not mod:
+                all_input = False
+                break
+            try:
+                if st.reader.port_direction(mod, sdef["port"]) != "Input":
+                    all_input = False          # 有一个是 Output → 不触发
+                    break
+            except Exception:
+                all_input = False
+                break
+            # 收集 writer 视图
+            try:
+                wid = ps.wire_id_of(sdef, st.h)
+                ent = st.registry.entries.get(wid)
+                for v in (getattr(ent, "views", None) or ()):
+                    vm, _, vp = v.partition(".")
+                    try:
+                        if st.reader.port_direction(vm, vp) == "Output":
+                            writers.append(v)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return all_input
 
     def _ltl_syntax_check(self, formula: str) -> Optional[str]:
         """LTL 语法预检(2026-10-06, 保守): 语法铁律的正则快查, 命中即免跑
@@ -313,6 +314,53 @@ class Dispatcher:
         if re.search(r"->[^#]{0,20}##|##\s*\d*\s*[^#]{0,20}->", f):
             return "## 操作数内出现 ->"
         return None
+
+    def batch_ic3_verify(self):
+        """bmc_first 模式的批量 IC3 验证 (2026-10-08):
+        树闭合后对全部 BMC 级 KB 条目对应的节点逐个跑 IC3。
+        全过 → KB 条目升级 proof_strength="ic3", 节点标 IC3_PROVEN。
+        有败 → 从 KB 剔除该条目 + 节点标 BMC_FAILED + 回滚其父。
+        返回 (总数, 成功数)。"""
+        if VERIFY_MODE != "bmc_first":
+            return (0, 0)
+        st = self.st
+        bmc_entries = [e for e in st.kb.entries
+                       if e.proof_strength == "bmc"]
+        total = len(bmc_entries)
+        ok = 0
+        for e in bmc_entries:
+            nid = e.node_origin
+            node = st.nodes.get(nid)
+            if node is None:
+                st.kb.remove(e.kid)
+                continue
+            raw = self.verifier(
+                module=node.derived.get("module") or
+                self.prop_module(node),
+                signals=self._materialize(
+                    self._node_sources(node))[0],
+                assert_formula=node.formula,
+                assumes=self._materialize(
+                    self._node_sources(node))[1][1:],
+                mode="ic3",
+                priors_by_module=self.priors_by_module)
+            self._record_outcome(nid, "batch_ic3", raw,
+                                 node.derived.get("module"))
+            if raw.get("verdict") == "PASS":
+                e.proof_strength = "ic3"
+                st.mark(nid, ps.IC3_PROVEN)
+                ok += 1
+            else:
+                st.kb.remove(e.kid)
+                st.mark(nid, ps.BMC_FAILED)
+                st.record_failure(nid, "VIOLATED",
+                                  cause="BATCH_IC3_FAIL",
+                                  evidence=f"批量IC3发现反例: "
+                                           f"{node.formula[:60]}")
+                self.report["events"].append(
+                    f"{nid}: 批量IC3 FAIL, 从KB剔除 {e.kid}")
+        self.report["batch_ic3"] = {"total": total, "passed": ok}
+        return (total, ok)
 
     def _kb_premises_for(self, node, module):
         """KB 默认前提 (2026-10-06, 用户裁定): 相关且可见的已证定理作为
@@ -379,7 +427,7 @@ class Dispatcher:
             sig_items = tuple(str(x) for x in (signals or []))
         key = (str(module), str(mode), _norm(assert_formula),
                tuple(sorted(_norm(a) for a in (assumes or []))),
-               sig_items, str(run_at or ""))
+               sig_items, str(run_at or ""), VERIFY_MODE)
         hit = self._verify_memo.get(key)
         if hit is not None:
             self._memo_hits += 1
@@ -475,7 +523,14 @@ class Dispatcher:
                     and self._try_alternate_modules(node_id):
                 return {"verdict": "PASS", "detail": "多落点: 候选模块证毕"}
             return raw                     # 带模块级反例波形
+        # bmc_first 模式 (2026-10-08): 只跑 BMC, 跳过 IC3(延后批量)
+        if VERIFY_MODE == "bmc_first":
+            return {"verdict": "PASS",
+                    "detail": str(raw.get("detail", "")) +
+                              " [bmc_first: IC3 deferred]"}
         raw2 = self.verifier(mode="ic3", **common)
+        if raw2.get("verdict") == "PASS":
+            node._ic3_verified = True    # 真正过了 IC3 的标记
         # 条件标记: 假设未全部兑现的证毕是【条件证毕】(账本/展示须区分)
         if raw2.get("verdict") == "PASS":
             asm = [self.st.nodes[self.st.nodes[a].discharged_by]
@@ -876,6 +931,13 @@ class Dispatcher:
                 continue
             self._llm_retries = 0
 
+        # bmc_first: 树闭合后批量 IC3 验证 (2026-10-08)
+        if VERIFY_MODE == "bmc_first" and st.done():
+            total, ok = self.batch_ic3_verify()
+            self.report["events"].append(
+                f"批量IC3: {ok}/{total} 通过"
+                + ("" if ok == total
+                   else f", {total-ok} 条剔除并回滚"))
         self.report["agent_calls"] = self.agent_calls
         self.report["done"] = st.done()
         if self.report["conclusion"] is None:
@@ -947,6 +1009,38 @@ class Dispatcher:
         st.stack.pop()          # 兜底
 
     # ------------------------------------------------------------------
+
+    def _strategy_hint(self, task):
+        """多次同模块失败的战略提示 (2026-10-09 用户语义):
+        前提: 分解的子性质都在当前模块(未尝试其它模块)
+        条件: 同节点连续 ≥3 次分解/验证失败
+        提示: ① CONJUNCT → 考虑分解到其它子模块
+              ② 否则 → 考虑改用 ASSUME"""
+        st = self.st
+        node = st.nodes.get(task)
+        if not node:
+            return None
+        fc = node.fail_count
+        if fc < 3:
+            return None
+        # 前提检查: 本轮分解是否有子性质放到了其它模块
+        # (有的话说明 agent 已在尝试其它模块, 不需要此提示)
+        if getattr(node, "_tried_other_module", False):
+            return None
+        recent = [f for f in st.failures if f.node == task][-5:]
+        causes = {f.cause for f in recent}
+        if "CONCLUSION_IS_INPUT" in causes:
+            return ("连续多次子性质结论是本模块 Input——CONJUNCT 分解应把 "
+                    "子性质放到 writer 模块视角提出, 不要在当前模块反复尝试")
+        if any(c in causes for c in ("QUICK_VERIFY_FAIL", "BMC_FAILED",
+                                     "MODULE_STUCK")):
+            return (f"本模块已连续 {fc} 次分解/验证失败(且子性质都在本模块)——"
+                    "请反思: "
+                    "① 若选 CONJUNCT, 考虑将子性质分解到其它子模块"
+                    "(利用信号等价类跨模块改写); "
+                    "② 若子性质确实属于本模块行为约束, 考虑改用 ASSUME "
+                    "在本模块引入环境假设后再证明")
+        return None
 
     def _chain_assumes(self, task):
         """3a (2026-10-06): 当前分解链(栈上祖先)的全部存活假设及兑现状态
@@ -1026,6 +1120,7 @@ class Dispatcher:
                         "nl": x.get("nl", ""), "trusted": x.get("trusted", True)}
                        for m, xs in self.priors.items() for x in xs],
             "round_history": getattr(node, "_rounds", []),
+            "策略提示(strategy_hint)": self._strategy_hint(task),
             "history": [vars(f) for f in st.failures if f.node == task][-3:],
             "constraints": {"locked": node.locked_conjunct},
         }
@@ -1249,8 +1344,18 @@ class Dispatcher:
                         st.refund_attempt(task)
                     bad = True
                     break
-                # 结论输入守卫(保守): 结论=单一信号原子且为本模块 Input
+                # 结论输入守卫 (2026-10-09 用户语义):
+                # CONJUNCT 分解出的子性质, 结论是本模块 Input → 直接拒绝
+                # (性质分解应把子性质放到 writer 模块视角, 不该放这里)
                 if self._conclusion_input_guard(task, r["id"]):
+                    st.record_failure(task, "ITER_EXCEED",
+                        cause="CONCLUSION_IS_INPUT",
+                        evidence=f"子性质结论信号在本模块是 Input(自由输入), "
+                                 f"模块级验证必出反例——CONJUNCT 分解应把 "
+                                 f"子性质放到 writer 模块视角提出",
+                        hint="结论是本模块自由输入 → 若继续分解(CONJUNCT), "
+                             "请把子性质 signals 登记到结论信号的驱动模块"
+                             "(writer)视角; 或改用 ASSUME 在本模块约束输入")
                     bad = True
                     break
                 if r.get("short_circuited"):
@@ -1270,6 +1375,17 @@ class Dispatcher:
                     continue
                 if not r.get("reused_from"):
                     subtasks.append((r["id"], "assert"))
+                # 检测子性质是否放到了其它模块(战略提示的前提检查)
+                try:
+                    child_mod = next(iter(
+                        (st.nodes[r["id"]].signals or {}).values()),
+                        {}).get("module")
+                    own_mod = node.derived.get("module") or \
+                        self.prop_module(node)
+                    if child_mod and own_mod and child_mod != own_mod:
+                        node._tried_other_module = True
+                except Exception:
+                    pass
                 setattr(st.nodes[r["id"]], "sub_owner", task)
             if not bad:
                 for a in dec.get("assumes") or []:
@@ -1553,44 +1669,9 @@ class Dispatcher:
                  or getattr(node, "_implication_passed", False)) and all(
                 st.nodes[c].status in (ps.IC3_PROVEN, ps.TIMEOUT_UNPROVED)
                 for c in node.children):
-            # 弃权连坐 (2026-10-06, run_20261006_173520 复盘): TIMEOUT 子节点
-            # 若曾作检查一前提(候选池成员), 当初的蕴含通过靠它支撑——弃权必须
-            # 连坐: 排除它重跑蕴含, 过了才能升级。否则出现"用没证完的性质
-            # 当前提闭合"的虚假证毕(实证: N6 弃权但蕴含已用它通过)
-            timed = [c for c in node.children
-                     if st.nodes[c].status == ps.TIMEOUT_UNPROVED]
-            if timed:
-                # 候选池已移除: 无法区分"曾当前提", 保守按全部依赖处理
-                relied = list(timed)
-                if relied:
-                    ok_srcs = [(st.nodes[c].formula, st.nodes[c].signals)
-                               for c in node.children
-                               if st.nodes[c].status == ps.IC3_PROVEN]
-                    raw = self._run_implication_premises(
-                        task, [(f, s) for f, s in ok_srcs])
-                    self._record_outcome(task, "implication_recheck", raw,
-                                         "Implication")
-                    if raw.get("verdict") != "PASS":
-                        st.record_failure(task, "ITER_EXCEED",
-                            cause="TIMEOUT_PREMISE_RELIED",
-                            evidence="蕴含闭合依赖了超时弃权的子性质: "
-                                     + "; ".join(st.nodes[c].formula[:50]
-                                                 for c in relied)
-                                     + " | 排除后重跑蕴含 "
-                                     + str(raw.get("verdict")),
-                            hint="这些子性质证不出来就不能作为拼图——请"
-                                 "改写它们为可证形式或补充其它子性质")
-                        # 三重断路 (2026-10-07 循环 bug 修复): 曾用
-                        # _rollback_after_fail——它回滚到 parent, 不清本节点
-                        # children/标志 → 升级分支带原状态反复重触发(N124
-                        # 空转 200 次实证)。改为: 清蕴含标志 + 回滚自身
-                        # (children 清空) + 计入尝试预算 → 下轮走分解或 SKIP
-                        node._implication_passed = False
-                        self._rollback(task, scope="local")
-                        st.register_attempt(task)
-                        if st.stack and st.stack[-1] == task:
-                            st.stack.pop()
-                        return
+            # 弃权连坐已移除 (2026-10-09 用户裁定): 前提正确性由
+            # KB 入库门禁+默认前提自动保证——通过→入KB→可作前提;
+            # 未通过→不入KB→不可能成为前提。N86 修复靠清扫。
             st.mark(task, ps.IC3_PROVEN)
             if st.stack and st.stack[-1] == task:
                 st.stack.pop()
@@ -1913,6 +1994,15 @@ class Dispatcher:
             if self._framework_abort(raw): return False
             if raw.get("verdict") != "PASS":
                 continue
+            # bmc_first (2026-10-09): 多落点也跳过 IC3, BMC 过即视为通过
+            if VERIFY_MODE == "bmc_first":
+                node.proven_at = cand
+                if node.status != ps.IC3_PROVEN:
+                    st.mark(node_id, ps.BMC_FILTERED)
+                self.report["events"].append(
+                    f"{node_id}: 多落点 BMC 过@{cand} (bmc_first)")
+                self._settle(node_id)
+                return True
             raw = self.verifier(mode="ic3", **common)
             self._record_outcome(node_id, "alt_ic3@" + cand, raw, cand)
             if self._framework_abort(raw): return False

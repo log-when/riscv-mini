@@ -383,3 +383,80 @@ class TestInternalStateBan(unittest.TestCase):
                 "module": "ICache",
                 "expr": "io.nasti.ar.valid && io.nasti.ar.ready"}}})
         self.assertNotIn("state", str(r))
+
+
+class TestSignalConsistency(unittest.TestCase):
+    """同一物理信号的多别名自动归一(不拒绝), 归一后公式改写+信号去重。"""
+
+    def test_same_wire_aliases_normalized(self):
+        st = mk_state()
+        st.nodes[st.root].strategy = "CONJUNCT"
+        spec = {
+            "formula": "dcacheReadReqReady_2 -> dcacheReadReqReady",
+            "signals": {
+                "dcacheReadReqReady_2": {
+                    "module": "ICache", "port": "io.nasti.ar.ready"},
+                "dcacheReadReqReady": {
+                    "module": "ICache", "port": "io.nasti.ar.ready"}}}
+        changed = st._normalize_signal_aliases(spec)
+        self.assertTrue(changed)
+        # 公式应被改写为 a -> a (同一别名)
+        self.assertEqual(spec["formula"],
+                         "dcacheReadReqReady_2 -> dcacheReadReqReady_2")
+        # 信号表只剩一个别名
+        self.assertEqual(len(spec["signals"]), 1)
+
+    def test_different_wires_not_normalized(self):
+        st = mk_state()
+        spec = {
+            "formula": "a -> F b",
+            "signals": {"a": {"module": "ICache", "port": "io.a"},
+                        "b": {"module": "ICache", "port": "io.b"}}}
+        changed = st._normalize_signal_aliases(spec)
+        self.assertFalse(changed)
+        self.assertEqual(spec["formula"], "a -> F b")
+
+    def test_different_wires_allowed(self):
+        st = mk_state()
+        st.nodes[st.root].strategy = "CONJUNCT"
+        # 不同端口 → 正常通过
+        r = st.add_property(st.root, {
+            "id": "C2", "nl": "x",
+            "formula": "a -> F b",
+            "signals": {"a": {"module": "ICache", "port": "io.a"},
+                        "b": {"module": "ICache", "port": "io.b"}}})
+        self.assertNotIn("error", str(r))
+
+
+class TestExprCanonical(unittest.TestCase):
+    """等价布尔组合归一: a&b 与 b&a 同模块内统一为同一别名。"""
+
+    def test_commutative_normalization(self):
+        st = mk_state()
+        st.nodes[st.root].strategy = "CONJUNCT"
+        spec = {
+            "formula": "ready1 -> F ready2",
+            "signals": {
+                "ready1": {"module": "ICache",
+                           "expr": "io.a && io.b"},
+                "ready2": {"module": "ICache",
+                           "expr": "io.b && io.a"}}}  # 交换顺序
+        changed = st._normalize_signal_aliases(spec)
+        self.assertTrue(changed)
+        # 两个别名应统一为一个
+        self.assertEqual(len(spec["signals"]), 1)
+        # 公式应改为统一后的名字
+        f = spec["formula"].replace(" ", "")
+        self.assertTrue(f == "ready1->Fready1" or f == "ready2->Fready2")
+
+    def test_different_module_not_unified(self):
+        st = mk_state()
+        spec = {
+            "formula": "x -> F y",
+            "signals": {
+                "x": {"module": "ICache", "expr": "io.a && io.b"},
+                "y": {"module": "DCache", "expr": "io.a && io.b"}}}
+        # 不同模块: 不应归一(子模块边界)
+        changed = st._normalize_signal_aliases(spec)
+        self.assertFalse(changed)
+        self.assertEqual(len(spec["signals"]), 2)

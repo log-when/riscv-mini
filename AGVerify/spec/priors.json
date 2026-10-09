@@ -103,7 +103,7 @@
   },
   {
     "id": "X7",
-    "formula": "G !dcacheCpuAbort",
+    "formula": "!dcacheCpuAbort",
     "nl": "系统配置: CPU 不中止挂起的 DCache 操作 (abort 恒低)",
     "trusted": true,
     "signals": {
