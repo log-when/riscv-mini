@@ -732,7 +732,7 @@ class TestKBDefaultPremises(unittest.TestCase):
         self.assertTrue(any(a.replace(" ", "") == "imemReq->FimemAck"
                             for a in seen['assumes']))
         # 溯源标记
-        self.assertIn("KB前提", str(raw.get("detail", "")) +
+        self.assertIn("KB:", str(raw.get("detail", "")) +
                       str(seen.get('assumes')))
 
 

@@ -426,6 +426,18 @@ class ProofState:
             s = ops[0].join(sorted(parts))
         return s
 
+    @staticmethod
+    def signal_path(s: Dict) -> str:
+        """信号的可执行路径: 优先 expr 本体, 其次剥前缀的 port。
+        所有消费者统一走此方法, 杜绝 expr: 前缀泄漏。"""
+        expr = s.get("expr")
+        if expr:
+            return expr.strip()
+        port = s.get("port") or ""
+        if port.startswith("expr:"):
+            return port[5:]
+        return port
+
     def _normalize_signal_aliases(self, spec: Dict) -> bool:
         """信号别名归一 (2026-10-09 用户语义):
         ① 同一物理信号(wire_id 相同)的别名 → 统一
@@ -555,34 +567,70 @@ class ProofState:
         self.registry.register(node_id, classified["derived"].get("signals", {}))
         return node
 
-    def check_binding_drift(self, formula: str, signals: Dict) -> None:
-        """同名公式内信号绑定的网络身份漂移检测:
-        同一公式(语法归一)再次出现时, 各别名的等价类代表必须一致——
-        否则属【跨模块重声明偷换网络】(如 nastiReadReqReady 从授权侧
-        io.icache.ar.ready 漂到外部侧 io.nasti.ar.ready), 拒绝。
-        多落点改写(等价网重命名)的 rep 相同, 不受影响。"""
+    def check_binding_drift(self, formula: str, signals: Dict) -> str:
+        """同名公式内信号绑定的网络身份漂移处理 (2026-10-10 用户语义:
+        检测保留, 拒绝改为自动改写):
+        同一公式再次出现时, 若某别名绑到了不同网络:
+        ① 新网络在 registry 中已有别名 → 改写公式用已有别名
+        ② 没有 → 重命名(加后缀)并改写公式
+        返回改写后的公式(None 表示无需改写)。"""
         if _se is None or not signals:
-            return
+            return formula
         key = norm_formula(formula)
         cur = _se.alias_reps(signals)
         prev = self._formula_nets.get(key)
         if prev is None:
             self._formula_nets[key] = cur
-            return
+            return formula
+        import re as _re
+        changed = False
+        rename = {}  # 旧别名 → 新别名
         for alias, rep in cur.items():
             old_rep = prev.get(alias)
             if old_rep is not None and old_rep != rep:
-                raise ProofStateError(
-                    f"信号 {alias} 的绑定发生网络漂移: 该公式此前绑定"
-                    f" {old_rep}(等价类代表), 本次绑到 {rep}——同名端口"
-                    f"在不同模块是不同网络。请使用等价端口(原网络在"
-                    f"驱动模块侧的对应端口)或以新别名表述不同性质")
+                # 漂移: 新网络 rep 不同于旧网络 old_rep
+                # ① 查 registry: 这个新网络上有没有已注册的别名
+                existing = None
+                for wid, ent in self.registry.entries.items():
+                    if rep in getattr(ent, 'views', set()):
+                        # 找到同网络的已注册引用
+                        for node_id, alias2 in ent.referenced_by:
+                            existing = alias2
+                            break
+                        if existing:
+                            break
+                if existing and existing != alias:
+                    rename[alias] = existing
+                    changed = True
+                else:
+                    # ② 重命名: alias_2, alias_3...
+                    i = 2
+                    new_a = f"{alias}_{i}"
+                    while new_a in cur or new_a in prev:
+                        i += 1
+                        new_a = f"{alias}_{i}"
+                    rename[alias] = new_a
+                    # 信号表同步更新
+                    if alias in signals:
+                        signals[new_a] = signals.pop(alias)
+                    changed = True
+        if not changed:
+            return formula
+        # 改写公式(长名优先)
+        for old_a in sorted(rename, key=len, reverse=True):
+            new_a = rename[old_a]
+            formula = _re.sub(r"\b%s\b" % _re.escape(old_a), new_a, formula)
+        # 更新网络记录(合并新旧绑定)
+        merged = dict(prev)
+        merged.update(cur)
+        self._formula_nets[key] = merged
+        return formula
 
     def add_property(self, parent: Optional[str], spec: Dict,
                      depth: Optional[int] = None) -> Dict:
         """assert 节点入树。任务开场正负双查（复用/短路）。"""
         self._normalize_signals(spec)
-        self.check_binding_drift(spec["formula"], spec.get("signals") or {})
+        spec["formula"] = self.check_binding_drift(spec["formula"], spec.get("signals") or {})
         wids_probe = [wire_id_of(s, self.h)
                       for s in (spec.get("signals") or {}).values()]
         # 负 KB 短路: 同签名已 VIOLATED → 直接失败节点, 不重跑
@@ -734,7 +782,7 @@ class ProofState:
         self._autocorrect_module(spec)
         self._normalize_signal_aliases(spec)
         self._check_signal_hosts(spec)
-        self.check_binding_drift(spec["formula"], spec.get("signals") or {})
+        spec["formula"] = self.check_binding_drift(spec["formula"], spec.get("signals") or {})
         gate = self._assume_gate_signals(spec["formula"])
         for local, s in (spec.get("signals") or {}).items():
             if gate.get(local, 'must_input') != 'must_input':

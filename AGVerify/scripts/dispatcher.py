@@ -119,7 +119,7 @@ class Dispatcher:
                         continue
                     seen[local] = s["port"]
                     self._num += 1
-                    sigs.append((local, s["port"], self._num))
+                    sigs.append((local, ps.ProofState.signal_path(s), self._num))
             self.priors_by_module[m] = {"signals": sigs,
                                         "assumes": formulas}
         self.report = {"rounds": 0, "conclusion": None, "events": [],
@@ -214,6 +214,14 @@ class Dispatcher:
     # ------------------------------------------------------------------
 
     def _record_outcome(self, node_id, phase, raw, module=None):
+        if not hasattr(self, "_outcome_records"):
+            self._outcome_records = []
+        import time as _time
+        self._outcome_records.append(
+            {"node": node_id, "phase": phase, "module": module,
+             "verdict": raw.get("verdict", ""),
+             "detail": raw.get("detail", ""),
+             "_ts": _time.strftime("%H:%M:%S")})
         """运行时结果账本(outcomes.jsonl): 逐性质逐阶段记录,
         SUMMARY 直接读取, 不再事后对账。"""
         import json as _json
@@ -362,26 +370,376 @@ class Dispatcher:
         self.report["batch_ic3"] = {"total": total, "passed": ok}
         return (total, ok)
 
-    def _kb_premises_for(self, node, module):
-        """KB 默认前提 (2026-10-06, 用户裁定): 相关且可见的已证定理作为
-        额外 chaAssume 烘进模块验证。过滤: ①相关性=与当前性质共享至少一条
-        网络(控制求解器负载); ②可见性=定理全部信号在本模块有端口视角
-        (registry wire views)。返回 [(公式, {别名:(模块,端口)}), ...]。"""
+    def _kb_path_filter(self, node, passed):
+        """KB 通路过滤 (2026-10-10 用户语义): CONJUNCT 蕴含检查的 KB 复用
+        基于条目间信号连通性——从目标+已过子性质的信号出发, 经 KB 条目间
+        共享网络做传递闭包, 只保留可连通的条目。返回 KBEntry 列表。"""
+        st = self.st
+        # 初始信号集: 目标信号 + 已过子性质的信号
+        wire_set = set()
+        try:
+            wire_set |= {ps.wire_id_of(x, st.h)
+                         for x in (node.signals or {}).values()}
+        except Exception:
+            pass
+        for n in passed:
+            try:
+                wire_set |= {ps.wire_id_of(x, st.h)
+                             for x in (n.signals or {}).values()}
+            except Exception:
+                pass
+        if not wire_set:
+            return []   # 无信号锚点, 不过滤(保守返回空)
+        # 传递闭包: 反复扫描 KB, 有新连通就扩展
+        included = []
+        included_ids = set()
+        changed = True
+        while changed:
+            changed = False
+            for e in st.kb.entries:
+                if id(e) in included_ids:
+                    continue
+                try:
+                    ew = {ps.wire_id_of(x, st.h)
+                          for x in (e.signals or {}).values()}
+                except Exception:
+                    continue
+                if ew & wire_set:
+                    included.append(e)
+                    included_ids.add(id(e))
+                    wire_set |= ew
+                    changed = True
+        return included
+
+    def _build_proof_tree(self):
+        """层次化证明恢复 (2026-10-10): SUCCESS 后自动构建证明树.
+
+        流程:
+        1. 从根出发计算传递依赖闭包(证明链)
+        2. 对链上每个节点做记忆化消融(BMC, 逐条移除 KB 前提)
+        3. 自顶向下渲染证明树 + 性质明细表
+
+        返回 markdown 字符串(追加到 SUMMARY).
+        """
+        st = self.st
+        nodes = st.nodes
+        kb_map = {e.kid: e for e in st.kb.entries}
+        root_id = st.root
+
+        # ── 1. 传递依赖闭包 ──
+        chain = {}
+
+        def _collect(node_id, depth=0):
+            if node_id in chain or depth > 20:
+                return
+            n = nodes.get(node_id)
+            if n is None or n.status != ps.IC3_PROVEN:
+                return
+            kb_used = self._get_node_kb_deps(node_id)
+            module = n.derived.get("module") or self.prop_module(n)
+            # 旧格式 fallback: 无 [KB:T...] 标签时, 用 broad 模式获取可见条目
+            # 时序过滤: 只含此节点验证之前已入 KB 的条目(防循环)
+            if not kb_used:
+                kb_srcs = self._kb_premises_for(n, module, broad=True)
+                all_kids = [src[2] for src in kb_srcs if len(src) > 2]
+                # 获取此节点的验证时间
+                node_ts = None
+                for rec in reversed(getattr(self, "_outcome_records", [])):
+                    if (rec.get("node") == node_id
+                            and rec.get("phase") == "module_ic3"):
+                        node_ts = rec.get("_ts", "")
+                        break
+                if node_ts:
+                    # KB 条目按 node_origin 的验证时间过滤
+                    kb_used = []
+                    for kid in all_kids:
+                        e = next((x for x in st.kb.entries
+                                  if x.kid == kid), None)
+                        if e is None:
+                            continue
+                        # 条目来源节点的验证时间
+                        e_ts = None
+                        for rec in reversed(
+                                getattr(self, "_outcome_records", [])):
+                            if (rec.get("node") == e.node_origin
+                                    and rec.get("phase") == "module_ic3"
+                                    and rec.get("verdict") == "PASS"):
+                                e_ts = rec.get("_ts", "")
+                                break
+                        # 只包含早于此节点的条目
+                        if e_ts is None or e_ts < node_ts:
+                            kb_used.append(kid)
+                else:
+                    kb_used = all_kids
+            chain[node_id] = {
+                "formula": n.formula, "module": module,
+                "kb_used": kb_used, "kind": n.kind,
+            }
+            for kid in kb_used:
+                if kid in kb_map:
+                    _collect(kid, depth + 1)
+            for c in (n.children or []):
+                _collect(c, depth + 1)
+            for a in (n.assumes or []):
+                an = nodes.get(a)
+                if an:
+                    did = an.discharged_by
+                    if did:
+                        _collect(did, depth + 1)
+
+        _collect(root_id)
+        if not chain:
+            return None
+
+        # ── 2. 记忆化消融 ──
+        ablation_cache = {}
+        do_ablation = ps.CONFIG.get("proof_tree_ablate", True)
+
+        def _ablate_node(node_id):
+            if node_id in ablation_cache:
+                return ablation_cache[node_id]
+            info = chain.get(node_id)
+            if not info or not info["kb_used"]:
+                ablation_cache[node_id] = []
+                return []
+            n = nodes.get(node_id)
+            if n is None:
+                ablation_cache[node_id] = info["kb_used"]
+                return info["kb_used"]
+
+            module = info["module"]
+            remaining = list(info["kb_used"])
+
+            for kid in sorted(info["kb_used"], reverse=True):
+                trial = [k for k in remaining if k != kid]
+                if not trial:
+                    continue
+                result = self._ablation_bmc(n, module, trial, kb_map)
+                if result == "PASS":
+                    remaining = trial
+                    self.report["events"].append(
+                        f"消融: {node_id} <- {kid} 冗余")
+                else:
+                    self.report["events"].append(
+                        f"消融: {node_id} <- {kid} 必要({result})")
+
+            ablation_cache[node_id] = remaining
+            return remaining
+
+        if do_ablation:
+            for nid in sorted(chain, key=lambda x: (0, x) if x.startswith("T")
+                              else (1, x)):
+                _ablate_node(nid)
+        else:
+            # 不消融时直接用全集
+            for nid in chain:
+                ablation_cache[nid] = chain[nid]["kb_used"]
+
+        # ── 2b. 充分性消融 (ASSUME 节点的有效性检查) ──
+        # 对 ASSUME 节点: "假设 + 设计 + KB[子集] ⊢ 目标" 的 KB 依赖
+        validity_cache = {}
+        if do_ablation:
+            for nid in sorted(chain):
+                info = chain[nid]
+                n = nodes.get(nid)
+                if n is None or n.kind != "assert":
+                    continue
+                # 检查是否有 assume_validity 的 outcome
+                has_validity = any(
+                    r.get("node") == nid and "validity" in str(r.get("phase", ""))
+                    for r in getattr(self, "_outcome_records", []))
+                if not has_validity or not info["kb_used"]:
+                    continue
+
+                # 充分性消融: 逐条移除 KB, 重跑 assume_validity
+                module = info["module"]
+                v_remaining = list(info["kb_used"])
+                for kid in sorted(info["kb_used"], reverse=True):
+                    trial = [k for k in v_remaining if k != kid]
+                    if not trial:
+                        continue
+                    result = self._ablation_validity(n, module, trial, kb_map)
+                    if result == "PASS":
+                        v_remaining = trial
+                        self.report["events"].append(
+                            f"充分性消融: {nid} <- {kid} 冗余")
+                    else:
+                        self.report["events"].append(
+                            f"充分性消融: {nid} <- {kid} 必要({result})")
+                validity_cache[nid] = v_remaining
+
+        # ── 3. 渲染 ──
+        L = ["\n## 7. 层次化证明树\n"]
+
+        def _render(node_id, indent, visited):
+            if node_id in visited:
+                L.append("  " * indent + "(ref) " + node_id)
+                return
+            visited.add(node_id)
+            pad = "  " * indent
+
+            if node_id in kb_map:
+                e = kb_map[node_id]
+                minimal = ablation_cache.get(node_id, [])
+                L.append(pad + f"[{e.kid}] `{e.formula[:55]}`"
+                         + f" @{e.proven_at or '?'}")
+                for kd in sorted(minimal):
+                    _render(kd, indent + 1, visited)
+            elif node_id in chain:
+                info = chain[node_id]
+                minimal = ablation_cache.get(node_id, info["kb_used"])
+                n = nodes.get(node_id)
+                L.append(pad + f"{node_id}: `{info['formula'][:50]}`"
+                         + f" @{info['module']}")
+                for kd in sorted(minimal):
+                    _render(kd, indent + 1, visited)
+                if n:
+                    for c in (getattr(n, 'children', None) or []):
+                        _render(c, indent + 1, visited)
+                    for a in (getattr(n, 'assumes', None) or []):
+                        an = nodes.get(a)
+                        if an:
+                            L.append("  " * (indent + 1)
+                                     + f"ASSUME: `{an.formula[:45]}`")
+                            did = getattr(an, 'discharged_by', None)
+                            if did:
+                                _render(did, indent + 2, visited)
+
+        _render(root_id, 0, set())
+
+        # 性质明细表
+        L.append("\n### 性质明细\n")
+        L.append("| 标签 | 性质 | 验证模块 | 最小依赖 |")
+        L.append("|---|---|---|---|")
+        for nid in sorted(chain):
+            info = chain[nid]
+            minimal = ablation_cache.get(nid, [])
+            if nid in kb_map:
+                e = kb_map[nid]
+                # 跨模块标注: 找谁使用了此条目
+                used_at = set()
+                for other_id, other_info in chain.items():
+                    if nid in other_info.get("kb_used", []):
+                        other_mod = other_info.get("module", "?")
+                        if other_mod != (e.proven_at or "?"):
+                            used_at.add(other_mod)
+                cross = f" → 使用@{','.join(used_at)}" if used_at else ""
+                v_min = validity_cache.get(nid, [])
+                v_str = f"; 充分性: {', '.join(v_min)}" if v_min else ""
+                L.append(f"| {e.kid} | `{e.formula[:40]}`"
+                         + f" | {e.proven_at or '?'}{cross}"
+                         + f" | {', '.join(minimal) or '(先验)'}{v_str} |")
+            else:
+                L.append(f"| {nid} | `{info['formula'][:40]}`"
+                         + f" | {info['module']}"
+                         + f" | {', '.join(minimal) or '(先验)'} |")
+
+        return "\n".join(L)
+
+    def _get_node_kb_deps(self, node_id):
+        """从 outcome 记录提取某节点的 KB 依赖([KB:...] 标签)."""
+        import re as _re
+        for rec in reversed(getattr(self, "_outcome_records", [])):
+            if (rec.get("node") == node_id
+                    and rec.get("verdict") == "PASS"
+                    and rec.get("phase") == "module_ic3"):
+                detail = str(rec.get("detail", ""))
+                m = _re.search(r'\[KB:([T0-9,]+)\]', detail)
+                if m:
+                    return m.group(1).split(",")
+                return []
+        return []
+
+    def _ablation_bmc(self, node, module, kb_kids, kb_map):
+        """消融 BMC: 用指定 KB 子集重跑模块 BMC."""
+        try:
+            sources = self._node_sources(node)
+            for kid in kb_kids:
+                e = kb_map.get(kid)
+                if e is None:
+                    continue
+                ports = {}
+                okvis = True
+                for al, x in (e.signals or {}).items():
+                    wid = ps.wire_id_of(x, self.st.h)
+                    ent = self.st.registry.entries.get(wid)
+                    v = next((t for t in (getattr(ent, "views", None) or [])
+                              if t.startswith(str(module) + ".")), None)
+                    if v is None:
+                        okvis = False
+                        break
+                    ports[al] = (str(module), v.split(".", 1)[1])
+                if okvis:
+                    sources.append((e.formula_raw or e.formula, ports))
+
+            decls, formulas = self._materialize(sources)
+            raw = self.verifier(
+                module=module, signals=decls,
+                assert_formula=formulas[0],
+                assumes=formulas[1:],
+                mode="bmc",
+                priors_by_module=self.priors_by_module)
+            self._record_outcome(node.id, "ablation_bmc", raw, module)
+            return raw.get("verdict", "?")
+        except Exception as e:
+            return "ERROR:" + str(e)[:30]
+
+    def _ablation_validity(self, node, module, kb_kids, kb_map):
+        """充分性消融 BMC: 用指定 KB 子集重跑 assume_validity."""
+        try:
+            sources = self._node_sources(node, with_assumes=True)
+            for kid in kb_kids:
+                e = kb_map.get(kid)
+                if e is None:
+                    continue
+                ports = {}
+                okvis = True
+                for al, x in (e.signals or {}).items():
+                    wid = ps.wire_id_of(x, self.st.h)
+                    ent = self.st.registry.entries.get(wid)
+                    v = next((t for t in (getattr(ent, "views", None) or [])
+                              if t.startswith(str(module) + ".")), None)
+                    if v is None:
+                        okvis = False
+                        break
+                    ports[al] = (str(module), v.split(".", 1)[1])
+                if okvis:
+                    sources.append((e.formula_raw or e.formula, ports))
+
+            decls, formulas = self._materialize(sources)
+            raw = self.verifier(
+                module=module, signals=decls,
+                assert_formula=formulas[0],
+                assumes=formulas[1:],
+                mode="bmc",
+                priors_by_module=self.priors_by_module)
+            self._record_outcome(node.id, "ablation_validity", raw, module)
+            return raw.get("verdict", "?")
+        except Exception as e:
+            return "ERROR:" + str(e)[:30]
+
+    def _kb_premises_for(self, node, module, broad=True):
+        """KB 默认前提 (2026-10-10 用户语义修订):
+        broad=True (检查二/module_ic3): 只检查可见性——凡能在本模块
+        落地的 KB 条目都烘入, 不限上限, 不要求与目标共享网络。
+        broad=False (保留接口): 旧模式, 相关性+可见性+上限。"""
         if not ps.CONFIG.get("kb_as_premises", True):
             return []
         st = self.st
-        try:
-            cur_wires = {ps.wire_id_of(x, st.h)
-                         for x in (node.signals or {}).values()}
-        except Exception:
-            return []
+        if not broad:
+            try:
+                cur_wires = {ps.wire_id_of(x, st.h)
+                             for x in (node.signals or {}).values()}
+            except Exception:
+                return []
         out = []
         for e in st.kb.entries:
             try:
                 esigs = e.signals or {}
-                ew = {ps.wire_id_of(x, st.h) for x in esigs.values()}
-                if not ew or not (ew & cur_wires):
-                    continue
+                if not broad:
+                    ew = {ps.wire_id_of(x, st.h) for x in esigs.values()}
+                    if not ew or not (ew & cur_wires):
+                        continue
                 ports = {}
                 okvis = True
                 for al, x in esigs.items():
@@ -394,9 +752,6 @@ class Dispatcher:
                         break
                     port_part = v.split(".", 1)[1]
                     if port_part.startswith("expr:"):
-                        # expr 视图泄漏修复 (2026-10-06, 本次重打——曾被
-                        # 批量替换覆盖丢失): 视图串带 expr: 前缀不能当 port,
-                        # 用条目自身 expr 定义(与 _node_sources._path 同语义)
                         expr = (x.get("expr") or port_part[5:]).strip()
                         if not expr:
                             okvis = False
@@ -405,10 +760,12 @@ class Dispatcher:
                     else:
                         ports[al] = (str(module), port_part)
                 if okvis:
-                    out.append((e.formula, ports))
+                    out.append((e.formula, ports, e.kid))
             except Exception:
                 continue
-        return out[:int(ps.CONFIG.get("kb_premises_max", 8))]
+        if not broad:
+            return out[:int(ps.CONFIG.get("kb_premises_max", 8))]
+        return out  # broad: 不限上限, 含 kid
 
     def _memo_verifier(self, module, signals, assert_formula, assumes,
                        mode, run_at=None, **kw):
@@ -492,17 +849,20 @@ class Dispatcher:
             return {"verdict": "ERROR", "detail": f"信号生成错误: {e}"}
         # KB 默认前提: 相关且可见的已证定理并入 assume 集(溯源记入明细)
         kb_srcs = self._kb_premises_for(node, module)
+        kb_kids = []
         if kb_srcs:
             try:
                 n_own = len(formulas)
                 decls, formulas = self._materialize(
-                    self._node_sources(node) + kb_srcs)
+                    self._node_sources(node)
+                    + [src[:2] for src in kb_srcs])
                 kb_used = formulas[n_own:]
+                kb_kids = [src[2] for src in kb_srcs]
             except SignalGenError:
                 kb_used = []
         else:
             kb_used = []
-        kb_tag = f" [KB前提×{len(kb_used)}]" if kb_used else ""
+        kb_tag = f" [KB:{','.join(kb_kids)}]" if kb_kids else ""
         if _trivially_true(formulas[0], decls):
             return {"verdict": "PASS",
                     "detail": "平凡真: 同网络退化 A -> F A, 免求解" + kb_tag}
@@ -699,9 +1059,12 @@ class Dispatcher:
             valid = {"verdict": "PASS", "detail": "assume_validity 已在阶段A通过"}
         else:
             premise_srcs = [(n.formula, n.signals) for n in passed]
-            for e in st.kb.entries:
+            # KB 通路过滤 (2026-10-10 用户语义): 不是全部 KB, 而是只保留
+            # 与目标信号经由 KB 条目间共享网络可连通的条目(传递闭包)
+            kb_reachable = self._kb_path_filter(pnode, passed)
+            for e in kb_reachable:
                 premise_srcs.append((e.formula_raw or e.formula,
-                                     e.signals))   # 全部 KB(原始可执行串)
+                                     e.signals))
             for m, xs in self.priors.items():
                 for x in xs:
                     premise_srcs.append((x["formula"], x["signals"]))
@@ -931,7 +1294,17 @@ class Dispatcher:
                 continue
             self._llm_retries = 0
 
-        # bmc_first: 树闭合后批量 IC3 验证 (2026-10-08)
+        # 层次化证明恢复 (2026-10-10): SUCCESS 后自动构建证明树
+        if st.done() and ps.CONFIG.get("proof_tree", True):
+            try:
+                tree_md = self._build_proof_tree()
+                if tree_md:
+                    self.report["proof_tree"] = tree_md
+            except Exception as e:
+                self.report["events"].append(
+                    f"证明树构建异常(不影响验证结果): {e}")
+
+        # bmc_first: 树闭合后批量 IC3 验证 (2026-08)
         if VERIFY_MODE == "bmc_first" and st.done():
             total, ok = self.batch_ic3_verify()
             self.report["events"].append(
@@ -1515,18 +1888,20 @@ class Dispatcher:
                 # KB 默认前提 (2026-10-06 补检查二): 相关且可见的已证定理
                 # 并入有效性前提——与 run_module_ic3 同一覆盖面
                 kb_srcs = self._kb_premises_for(node, home)
+                kb_kids = []
                 if kb_srcs:
                     try:
                         n_own = len(formulas)
                         decls, formulas = self._materialize(
                             self._node_sources(node, with_assumes=True)
-                            + kb_srcs)
+                            + [src[:2] for src in kb_srcs])
                         kb_used = formulas[n_own:]
+                        kb_kids = [src[2] for src in kb_srcs]
                     except SignalGenError:
                         kb_used = []
                 else:
                     kb_used = []
-                kb_tag = f" [KB前提×{len(kb_used)}]" if kb_used else ""
+                kb_tag = f" [KB:{','.join(kb_kids)}]" if kb_kids else ""
                 common = dict(module=home, signals=decls,
                               assert_formula=formulas[0],
                               assumes=formulas[1:],
@@ -1983,8 +2358,7 @@ class Dispatcher:
                     "verdict": "INFO", "detail": why}, cand)
                 reasons.append(why)
                 continue
-            decls = [(a, (s["port"][5:] if s["port"].startswith("expr:")
-                          else s["port"]), i + 1)
+            decls = [(a, ps.ProofState.signal_path(s), i + 1)
                      for i, (a, s) in enumerate(sigs.items())]
             common = dict(module=cand, signals=decls,
                           assert_formula=node.formula, assumes=[],

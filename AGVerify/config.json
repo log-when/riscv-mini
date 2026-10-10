@@ -19,5 +19,7 @@
   "timeout_retry_max": 5,
   "kb_as_premises": true,
   "kb_premises_max": 8,
-  "verify_mode": "bmc_first"
+  "verify_mode": "standard",
+  "proof_tree": true,
+  "proof_tree_ablate": true
 }
