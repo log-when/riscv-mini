@@ -69,7 +69,8 @@ def gen(run_dir: Path):
         d = json.loads(line)
         if d.get('kind') == 'decision':
             items_by_round.append((d['node'], d.get('goal'), d.get('goal_nl'),
-                                   d.get('strategy'), d.get('items', [])))
+                                   d.get('strategy'), d.get('items', []),
+                                   d.get('ts', '')))
         elif d.get('phase'):
             ph[norm(d['formula'])].append(
                 (d['phase'], d.get('verdict'), d.get('module'), d.get('detail', '')))
@@ -107,7 +108,7 @@ def gen(run_dir: Path):
 
     L.append('## 2. 目标演化轨迹\n')
     seen_goal = {}
-    for rn, (node, goal, _, strat, items) in enumerate(items_by_round, 1):
+    for rn, (node, goal, _, strat, items, _ts) in enumerate(items_by_round, 1):
         seen_goal.setdefault(goal, []).append(rn)
     for goal, rounds in seen_goal.items():
         tag = f'(×{len(rounds)})' if len(rounds) > 1 else ''
@@ -117,35 +118,86 @@ def gen(run_dir: Path):
     L.append('## 3. 逐轮摘要表\n')
     L.append('| 轮 | node | 目标(缩写) | 策略 | 性质数 |')
     L.append('|---|---|---|---|---|')
-    for rn, (node, goal, _, strat, items) in enumerate(items_by_round, 1):
+    for rn, (node, goal, _, strat, items, _ts) in enumerate(items_by_round, 1):
         g = goal if len(goal) <= 44 else goal[:42] + '…'
         L.append(f'| {rn} | {node} | {g} | {strat} | {len(items)} |')
     L.append('')
 
-    L.append('## 4. 逐条性质明细表（全量去重）\n')
+    L.append('## 4. 逐条性质明细表（每轮全量, 含重复）\n')
     L.append('图例: G=全局BMC M=模块BMC I=模块IC3; ✓通过 ✗@N第N拍反例 —未达 '
              '★完备证毕; (…)内多落点; 复用/截留=KB复用或未上BMC。')
-    L.append('每轮先列任务目标, 再列生成性质; 信号每行一条(别名 = 模块.定义)。\n')
+    L.append('每轮先列任务目标, 再列全部生成性质(不去重, 重复标 ×N); '
+             '信号每行一条(别名 = 模块.定义); 轮末标有效性检查结果。\n')
     seen = set()
-    for rn, (node, goal, goal_nl, strat, items) in enumerate(items_by_round, 1):
+    seen_count = {}
+    # 预收集每轮的有效性检查结果(按时间窗口匹配)
+    # 收集各轮的失败记录(assume/property 被拒的原因)
+    _round_failures = {}
+    for line2 in open(run_dir / 'outcomes.jsonl'):
+        d2 = json.loads(line2)
+        if d2.get('kind') == 'decision':
+            pass  # 轮号从 items_by_round 获取
+    # 失败记录在 final_proof_state 里, 按 node+round 匹配
+    try:
+        fps = json.load(open(run_dir / 'final_proof_state.json'))
+        for f2 in fps.get('failures', []):
+            rn2 = f2.get('round', 0)
+            _round_failures.setdefault(rn2, []).append(f2)
+    except Exception:
+        pass
+    _raw_valids = [(d.get('ts',''), d.get('phase',''), d.get('verdict',''),
+                    str(d.get('detail',''))[:60])
+                   for d in map(json.loads, open(run_dir / 'outcomes.jsonl'))
+                   if d.get('phase') and ('validity' in d.get('phase','')
+                                          or d.get('phase') == 'implication')]
+    valid_events = _raw_valids
+    for rn, (node, goal, goal_nl, strat, items, rts) in enumerate(items_by_round, 1):
         L.append(f'**轮{rn} · node={node} · 策略={strat}**\n')
         L.append(f'> 任务目标: `{goal}`')
         L.append(f'> （{goal_nl}）\n')
         for it in items:
             if 'candidate_actions' in it: continue
             f = it['formula']; k = norm(f)
-            if k in seen: continue
+            seen_count[k] = seen_count.get(k, 0) + 1
+            dup_tag = f' ×{seen_count[k]}' if k in seen else ''
             seen.add(k)
             sigs = it.get('signals') or {}
             mod = next(iter(sigs.values()))['module'] if sigs else '?'
             ab = {'ICache': 'IC', 'MemArbiter': 'MA', 'Datapath': 'DP',
                   'DCache': 'DC', 'Tile': 'T'}.get(mod, mod)
-            L.append(f'- [{ab}] `{f}`')
+            L.append(f'- [{ab}] `{f}`{dup_tag}')
             for a, s in sigs.items():
                 port = s.get('port')
                 loc = port if port else 'expr:' + (s.get('expr') or '?')
                 L.append(f'  - {a} = {s["module"]}.{loc}')
             L.append(f'  - 结果: {enc(ph.get(k, []))}')
+        # 本轮被拒性质(从失败记录提取, 标注原因)
+        round_fails = _round_failures.get(rn, [])
+        if round_fails:
+            for f2 in round_fails:
+                cause2 = f2.get('cause', '?')
+                ev2 = str(f2.get('evidence', ''))[:70]
+                L.append(f'')
+                L.append(f'  **被拒: ⚠ {cause2}** {ev2}')
+            L.append(f'  (因上述被拒, 本轮回滚, 未做有效性检查)')
+
+        # 本轮有效性检查结果(时间窗口: 本轮 ts 到下一轮 ts)
+        # 轮内按 phase 去重(BMC+IC3 两段只报最终结果), 保留最后一条
+        next_ts = items_by_round[rn][5] if rn < len(items_by_round) else '99:99'
+        round_valids = [(ts2, ph2, v2, det2) for ts2, ph2, v2, det2 in valid_events
+                        if rts <= ts2 < next_ts]
+        if round_valids:
+            by_phase = {}
+            for ev in round_valids:
+                by_phase[ev[1]] = ev  # 后者覆盖前者(最终结果)
+            for ph2, (ts2, _, v2, det2) in sorted(by_phase.items()):
+                # ASSUME 轮只显示 assume_validity; implication 属于兑现节点
+                # (CONJUNCT) 的轮末检查, 混入父 ASSUME 窗口会误导
+                if strat == 'ASSUME' and ph2 == 'implication':
+                    continue
+                icon = {'PASS': '✓', 'FAIL': '✗', 'ERROR': '⚠'}.get(v2, '?')
+                L.append(f'')
+                L.append(f'  **检查: {icon} {v2}** ({ph2}) {det2}')
         L.append('')
 
     L.append('## 5. 已证毕性质清单（模块 IC3, 按子模块）\n')
